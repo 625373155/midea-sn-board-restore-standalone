@@ -1,0 +1,9 @@
+@echo off
+setlocal
+cd /d "%~dp0"
+echo OFFLINE SELF-TEST: no Wi-Fi or TCP operation exists in this mode.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0midea_sn_restore.ps1" -Mode SelfTest
+set "RC=%ERRORLEVEL%"
+echo.
+pause
+exit /b %RC%
