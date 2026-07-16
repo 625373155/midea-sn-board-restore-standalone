@@ -1,0 +1,2 @@
+# No third-party Python packages are required.
+# Runtime requirements are Python 3.10+ and Windows PowerShell 5.1+.
