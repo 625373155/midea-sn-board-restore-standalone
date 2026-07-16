@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "protocol_version": "midea-ac-body-sn-verified-v1",
+  "purpose": "Public regression corpus containing synthetic identities only. No value authorizes a device write.",
+  "synthetic_only": true,
+  "encoding_vectors": [
+    {
+      "body_sn": "1234567890123456789012",
+      "encoded_hex": "25 14 30 00 00 0D 26 1D 3D 18 14 21 1D 11 18 11 30 3D 21 26 0D 02",
+      "regression_only": true
+    }
+  ],
+  "known_frame_vector": {
+    "body_sn": "1234567890123456789012",
+    "counter": 1,
+    "write_inner_hex": "AA 24 AC 00 00 00 00 00 01 0F 80 41 25 14 30 00 00 0D 26 1D 3D 18 14 21 1D 11 18 11 30 3D 21 26 0D 02 01 72 8F",
+    "write_cipher_hex": "55 9E D5 96 DE 32 48 55 B2 F4 F1 5D B0 B0 F6 91 37 A6 36 42 DA 7B 6C A1 54 C0 BC 88 82 D8 F9 D4 CF 3C E2 77 FC 5A 09 EF 14 FA AC E6 B6 0F 32 1F",
+    "query_inner_hex": "AA 24 AC 00 00 00 00 00 01 0F 80 40 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 01 2C 33",
+    "query_cipher_hex": "23 66 1F C7 96 4A 42 A1 5D 09 23 CC C6 0E 45 F8 35 C0 20 DB A1 85 B2 7A 2C E1 42 A7 2C B8 2D B1 A4 DE AD 30 0A A8 AF 4B 84 D0 A4 AD E4 9B CB 37",
+    "transport_length": 104,
+    "regression_only": true
+  },
+  "counter_vectors": [
+    {
+      "body_sn": "1234567890123456789012",
+      "operation": "query",
+      "counter": 2,
+      "regression_only": true,
+      "inner_hex": "AA 24 AC 00 00 00 00 00 01 0F 80 40 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 02 CE 90",
+      "cipher_hex": "23 66 1F C7 96 4A 42 A1 5D 09 23 CC C6 0E 45 F8 35 C0 20 DB A1 85 B2 7A 2C E1 42 A7 2C B8 2D B1 1E 30 6C 76 14 FF 0F A0 BF EC A8 D8 02 23 81 CB"
+    }
+  ],
+  "invalid_body_sn_inputs": [
+    {"value": "", "reason": "empty"},
+    {"value": "123456789012345678901", "reason": "21 digits"},
+    {"value": "12345678901234567890123", "reason": "23 digits"},
+    {"value": "12345678901234567890O2", "reason": "ASCII letter"},
+    {"value": "12345678901234567890-2", "reason": "separator"},
+    {"value": " 1234567890123456789012", "reason": "leading space must not be trimmed"},
+    {"value": "1234567890123456789012\n", "reason": "line ending must not be trimmed"},
+    {"value": "\uff11\uff12\uff13\uff14\uff15\uff16\uff17\uff18\uff19\uff10\uff11\uff12\uff13\uff14\uff15\uff16\uff17\uff18\uff19\uff10\uff11\uff12", "reason": "Unicode full-width digits"},
+    {"value": "00000012345678901234567890120000", "reason": "32-digit App display must not be sliced"}
+  ],
+  "ssid_vectors": {
+    "valid": [
+      {
+        "input": "midea_test_a1b2c3d4e5f6",
+        "canonical_lower": "midea_test_a1b2c3d4e5f6",
+        "normalized_for_device_key": "mideatesta1b2c3d4e5f6"
+      }
+    ],
+    "invalid": [
+      "midea_test_a1b2c3d4e5f",
+      "midea_test_a1b2c3d4e5f60",
+      "midea_test_a1b2c3d4e5fg",
+      "midea_test _a1b2c3d4 e5f6",
+      "midea_a1b2c3d4e5f6",
+      "other_test_a1b2c3d4e5f6"
+    ]
+  },
+  "app_evidence_example": {
+    "body_sn": "1234567890123456789012",
+    "displayed_sn": "00000012345678901234567890120000",
+    "relationship": "000000 + body_sn + 0000",
+    "classification_when_all_other_conditions_hold": "WRITE_SENT_APP_VERIFIED",
+    "generic_conversion_rule": false,
+    "generator_input_allowed": false,
+    "synthetic_only": true
+  }
+}
