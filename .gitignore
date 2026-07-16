@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Generated packages contain a real device identity and repair evidence.
+output/
+generated/
+packages/
+midea-sn-*/
+midea-sn-*.zip
+midea-sn-*.zip.sha256
+TARGET.json
+WRITE-ATTEMPTED-DO-NOT-RERUN.jsonl
+READ-ONLY-ALREADY-CORRECT.jsonl
+READ-MISMATCH-DO-NOT-WRITE.jsonl
+READ-INVALID-DO-NOT-WRITE.jsonl
+DIAGNOSTIC-ZERO-BYTES.json
+
+# Real diagnostics and screenshots must remain private.
+*.log
+diagnostic*.txt
+app-evidence*/
+screenshots*/
