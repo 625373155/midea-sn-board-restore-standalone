@@ -1,0 +1,12 @@
+@echo off
+setlocal
+cd /d "%~dp0"
+echo DANGER: ONE PHYSICAL-BOARD INCIDENT, ONE WRITE REQUEST ONLY.
+echo Read 使用说明.md and run 03_raw_read_only_diagnostic.cmd first.
+echo Never rerun this launcher after a write reservation or an unknown result.
+echo.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0midea_sn_restore.ps1" -Mode Write
+set "RC=%ERRORLEVEL%"
+echo.
+pause
+exit /b %RC%
