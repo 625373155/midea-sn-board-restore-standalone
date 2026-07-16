@@ -1,0 +1,9 @@
+@echo off
+setlocal
+cd /d "%~dp0"
+echo POST-WRITE READ-ONLY CHECK: this launcher cannot authorize an SN write.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0midea_sn_restore.ps1" -Mode PostWriteCheck
+set "RC=%ERRORLEVEL%"
+echo.
+pause
+exit /b %RC%
