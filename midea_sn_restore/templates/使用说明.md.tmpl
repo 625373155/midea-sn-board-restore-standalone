@@ -1,0 +1,50 @@
+# 美的空调新主板 SN 单次恢复包
+
+此包只对应一台获授权维修的空调和一次实体主板更换事件，目标信息已经写死，运行时不能改成别的号码。
+
+本发布版的兼容型号白名单只有 `KFR-26G/WXAA2@`。热点格式相同不能证明其他型号兼容；若下表机型不是该精确值，请停止。
+
+| 项目 | 固化值 |
+|---|---|
+| 机型 | `@@MODEL@@` |
+| 原机 22 位 SN | `@@TARGET_SN@@` |
+| SN 可信来源 | `@@SN_SOURCE@@` |
+| 维修热点 | `@@EXPECTED_SSID@@` |
+| BSSID | `@@EXPECTED_BSSID@@` |
+| 事件 ID | `@@INCIDENT_ID@@` |
+| 生成时间 UTC | `@@GENERATED_UTC@@` |
+
+## 安全边界
+
+- 仅用于你拥有或获明确授权维修的美的家用空调新换主板。
+- SN 必须来自目标机器原标签、旧 App、旧主板或美的客服，不能猜号、借用另一台机器的号码或批量写入。
+- 32 位 App 显示值不能作为写入输入，也不能自动截取中间 22 位。
+- 服务端口零响应既不能证明主板为空，也不能证明写入失败；ACK 也不等于写入成功。
+- 不修改家庭 Wi-Fi、云端绑定或账号权限。
+
+## 推荐顺序
+
+1. 先双击 `00_self_test.cmd`；它是完全离线的协议和身份自检，必须显示 `PASS`。
+2. 让空调断电约 30 秒，再通电进入维修热点状态；电脑只连接 `@@EXPECTED_SSID@@`。
+3. 双击 `01_query_only.cmd`。若严格读回目标 SN，脚本会建立 `READ-ONLY-ALREADY-CORRECT-DO-NOT-WRITE.jsonl` 永久停止标记并结束；若读到其他有效码，则建立 `READ-MISMATCH-DO-NOT-WRITE.jsonl`；若完整性通过但 SN 载荷无法解码为 22 位 ASCII 数字，则建立 `READ-INVALID-DO-NOT-WRITE.jsonl`。三种情况都禁止写入且必须保留标记；后两种还要交由授权维修复核。
+4. 若无可用响应，双击 `03_raw_read_only_diagnostic.cmd`。只有结果为 `ZERO_RESPONSE_BYTES` 时才会生成与本事件绑定的诊断回执；请牢记零字节不是空板证明。
+5. 再次核对实体新主板、原机 SN 来源、机型和热点后，才可双击 `02_restore_once_and_verify.cmd`。它会要求逐项输入：
+   - 完整 22 位 SN；
+   - `NEW-BOARD-AND-ORIGINAL-SN-CONFIRMED`；
+   - `ZERO-BYTES-IS-NOT-PROOF`；
+   - `@@WRITE_CONFIRMATION@@`。
+6. 写路径在打开 TCP 前创建包内及电脑全局永久事件锁，只构造并发送一条 `0x41` 请求；之后最多发送三次纯只读 `0x40` 查询，不会重连补写。
+7. 若严格回读目标码，可判定协议层成功。若结果为 UNKNOWN、零响应、异常或断连，都禁止再次运行 02。
+8. UNKNOWN 时只做一次断电重启，重新用官方 App 配网并检查设备信息、开关、温度和模式；也可以运行 `04_post_write_read_only_check.cmd`，它只读。保留 App 截图和控制结果供人工分类。
+
+## 永久锁说明
+
+全局记录位于：
+
+`%LOCALAPPDATA%\MideaSnBoardRestore\devices\@@DEVICE_KEY@@\incidents\@@INCIDENT_ID@@\WRITE-ONCE.jsonl`
+
+包内记录名为 `WRITE-ATTEMPTED-DO-NOT-RERUN.jsonl`。它们会在网络写入前落盘；即使连接失败或发送结果不确定，也不提供删除、解锁或强制重试功能。若将来确实再次更换另一块实体主板，应建立新的维修事件并保留旧事件，而不是清除旧锁。
+
+若锁已建立、但进程在 `NetworkStream.Write` 开始前失败，审计会追加 `WRITE_NOT_SENT_BUT_LOCKED`。这只说明本进程没有开始网络写，不恢复写资格；不要删除标记或重跑 02，应交由人工代码/审计复核。
+
+本地锁是保守的防误操作措施，不是跨电脑、不可篡改的硬件 DRM。不要通过换电脑或重新解压来规避它。
