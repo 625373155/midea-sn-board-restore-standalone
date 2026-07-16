@@ -1,0 +1,11 @@
+* text=auto
+*.py text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.ps1.tmpl text eol=crlf
+*.cmd text eol=crlf
+*.cmd.tmpl text eol=crlf
+*.txt.tmpl text eol=crlf
+
