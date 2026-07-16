@@ -1,0 +1,1591 @@
+param(
+    [ValidateSet('Query', 'Write', 'Diagnostic', 'PostWriteCheck', 'SelfTest')]
+    [string]$Mode = 'Query'
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# Generated offline for one owner-authorized appliance and one physical-board
+# replacement incident. This is not a generic runtime SN writer: identity,
+# model, evidence source, hotspot and event ID are immutable in this file.
+$ExpectedSsidDisplay = '@@EXPECTED_SSID@@'
+$ExpectedSsidNormalized = '@@EXPECTED_SSID_NORMALIZED@@'
+$ExpectedBssid = '@@EXPECTED_BSSID@@'
+$ExpectedBssidRequired = @@EXPECTED_BSSID_REQUIRED@@
+$TargetModel = '@@MODEL@@'
+$SnEvidenceSource = '@@SN_SOURCE@@'
+$IncidentId = '@@INCIDENT_ID@@'
+$GeneratedUtc = '@@GENERATED_UTC@@'
+$TargetSn = '@@TARGET_SN@@'
+$TargetSnMasked = $TargetSn.Substring(0, 6) + ('*' * 12) + $TargetSn.Substring(18, 4)
+[byte[]]$TargetEncodedSn = @(
+    @@TARGET_ENCODED_ARRAY@@
+)
+
+$TargetHost = '192.168.1.1'
+$TargetPort = 6444
+$AesKeyText = 'd4d5jljeiasdrc33'
+$WriteAttemptLockDirectory = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'MideaSnBoardRestore\devices\@@DEVICE_KEY@@\incidents\@@INCIDENT_ID@@'
+$WriteAttemptLockPath = Join-Path $WriteAttemptLockDirectory 'WRITE-ONCE.jsonl'
+$PackageWriteAttemptMarkerPath = Join-Path $PSScriptRoot 'WRITE-ATTEMPTED-DO-NOT-RERUN.jsonl'
+$DiagnosticReceiptPath = Join-Path $PSScriptRoot 'DIAGNOSTIC-ZERO-BYTES.json'
+$AlreadyCorrectGlobalPath = Join-Path $WriteAttemptLockDirectory 'READ-ONLY-ALREADY-CORRECT.jsonl'
+$AlreadyCorrectPackagePath = Join-Path $PSScriptRoot 'READ-ONLY-ALREADY-CORRECT-DO-NOT-WRITE.jsonl'
+$MismatchGlobalPath = Join-Path $WriteAttemptLockDirectory 'READ-MISMATCH-DO-NOT-WRITE.jsonl'
+$MismatchPackagePath = Join-Path $PSScriptRoot 'READ-MISMATCH-DO-NOT-WRITE.jsonl'
+$InvalidEncodingGlobalPath = Join-Path $WriteAttemptLockDirectory 'READ-INVALID-DO-NOT-WRITE.jsonl'
+$InvalidEncodingPackagePath = Join-Path $PSScriptRoot 'READ-INVALID-DO-NOT-WRITE.jsonl'
+$WriteConfirmationPhrase = '@@WRITE_CONFIRMATION@@'
+# A freshly generated package starts unlocked. Atomic persistent markers make
+# Write unreachable forever after the first reservation for this event.
+$KnownPriorWriteAttempt = $false
+
+function ConvertTo-Hex {
+    param([byte[]]$Bytes)
+    return [BitConverter]::ToString($Bytes).Replace('-', ' ')
+}
+
+function Normalize-Ssid {
+    param([string]$Ssid)
+    if ([string]::IsNullOrWhiteSpace($Ssid)) {
+        return ''
+    }
+    return (($Ssid.ToLowerInvariant()) -replace '[\s_]', '')
+}
+
+function Get-FileSha256Hex {
+    param([string]$Path)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $stream.Dispose()
+        $sha.Dispose()
+    }
+}
+
+function Assert-PackageIntegrity {
+    $manifestPath = Join-Path $PSScriptRoot 'TARGET.json'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        throw 'Package integrity failed: TARGET.json is missing.'
+    }
+    try {
+        $manifestText = [System.IO.File]::ReadAllText($manifestPath, [Text.Encoding]::UTF8)
+        $manifest = $manifestText | ConvertFrom-Json
+    }
+    catch {
+        throw "Package integrity failed: TARGET.json is not valid UTF-8 JSON. $($_.Exception.Message)"
+    }
+
+    $manifestBssid = if ($null -eq $manifest.network.expectedBssid) { '' } else { [string]$manifest.network.expectedBssid }
+    if (
+        $manifest.schemaVersion -ne 1 -or
+        $manifest.generator.offlineOnly -ne $true -or
+        [string]$manifest.repairEvent.incidentId -cne $IncidentId -or
+        [string]$manifest.repairEvent.deviceKey -cne '@@DEVICE_KEY@@' -or
+        [string]$manifest.target.bodySn -cne $TargetSn -or
+        [string]$manifest.target.model -cne $TargetModel -or
+        [string]$manifest.target.snSource -cne $SnEvidenceSource -or
+        [string]$manifest.network.expectedServiceSsid -cne $ExpectedSsidDisplay -or
+        [string]$manifest.network.normalizedServiceSsid -cne $ExpectedSsidNormalized -or
+        $manifestBssid -cne $ExpectedBssid -or
+        [string]$manifest.network.targetHost -cne $TargetHost -or
+        [int]$manifest.network.targetPort -ne $TargetPort -or
+        [string]$manifest.protocol.applianceType -cne '0xAC' -or
+        [string]$manifest.protocol.queryOpcode -cne '0x40' -or
+        [string]$manifest.protocol.writeOpcode -cne '0x41' -or
+        [string]$manifest.safety.writeConfirmation -cne $WriteConfirmationPhrase -or
+        [int]$manifest.safety.writeRequestLimit -ne 1 -or
+        $manifest.safety.writeRetryAllowed -ne $false
+    ) {
+        throw 'Package integrity failed: TARGET.json metadata does not match the immutable PowerShell target.'
+    }
+
+    $properties = @($manifest.files.PSObject.Properties)
+    if ($properties.Count -lt 1 -or @($properties | Where-Object { $_.Name -ceq 'midea_sn_restore.ps1' }).Count -ne 1) {
+        throw 'Package integrity failed: the manifest file table is missing the PowerShell entry.'
+    }
+    $root = [System.IO.Path]::GetFullPath($PSScriptRoot)
+    $rootPrefix = $root.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+    foreach ($property in $properties) {
+        $relative = [string]$property.Name
+        $expectedHash = ([string]$property.Value).ToLowerInvariant()
+        $parts = @($relative -split '/')
+        if (
+            [string]::IsNullOrWhiteSpace($relative) -or
+            $relative.Contains('\') -or
+            [System.IO.Path]::IsPathRooted($relative) -or
+            $parts -contains '' -or
+            $parts -contains '.' -or
+            $parts -contains '..' -or
+            $relative -ceq 'TARGET.json' -or
+            $expectedHash -cnotmatch '^[0-9a-f]{64}$'
+        ) {
+            throw "Package integrity failed: unsafe manifest file entry '$relative'."
+        }
+        $localRelative = $relative.Replace('/', [System.IO.Path]::DirectorySeparatorChar)
+        $candidate = [System.IO.Path]::GetFullPath((Join-Path $root $localRelative))
+        if (-not $candidate.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Package integrity failed: manifest path escapes the package: '$relative'."
+        }
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            throw "Package integrity failed: declared file is missing: '$relative'."
+        }
+        if ((Get-FileSha256Hex -Path $candidate) -cne $expectedHash) {
+            throw "Package integrity failed: SHA-256 mismatch for '$relative'."
+        }
+    }
+}
+
+function Get-TargetWifiBinding {
+    $wirelessType = [System.Net.NetworkInformation.NetworkInterfaceType]::Wireless80211
+    $upState = [System.Net.NetworkInformation.OperationalStatus]::Up
+    $ipv4Family = [System.Net.Sockets.AddressFamily]::InterNetwork
+    $candidates = @()
+    $seenSsids = @()
+
+    $interfaces = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+        Where-Object { $_.OperationalStatus -eq $upState -and $_.NetworkInterfaceType -eq $wirelessType }
+
+    foreach ($interface in $interfaces) {
+        $lines = & netsh.exe wlan show interfaces "name=$($interface.Name)" 2>$null
+        $ssid = $null
+        $bssid = $null
+        foreach ($line in $lines) {
+            if ($line -match '^\s*SSID\s*:\s*(.+?)\s*$') {
+                $ssid = $Matches[1]
+            }
+            elseif ($line -match '^\s*BSSID\s*:\s*([0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5})\s*$') {
+                $bssid = ($Matches[1].ToLowerInvariant() -replace '-', ':')
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($ssid)) {
+            continue
+        }
+        $seenSsids += $ssid
+        if ($ssid -cne $ExpectedSsidDisplay) {
+            continue
+        }
+        if ($ExpectedBssidRequired -and $bssid -cne $ExpectedBssid) {
+            throw "The SSID matches, but its BSSID '$bssid' does not match the package-bound BSSID '$ExpectedBssid'. Nothing was sent."
+        }
+
+        $properties = $interface.GetIPProperties()
+        $addressEntry = $properties.UnicastAddresses |
+            Where-Object {
+                $_.Address.AddressFamily -eq $ipv4Family -and
+                $_.Address.IPAddressToString -match '^192\.168\.1\.(?:[2-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-4])$'
+            } |
+            Select-Object -First 1
+        if ($null -eq $addressEntry) {
+            throw "The target hotspot is connected on '$($interface.Name)', but it has no usable 192.168.1.x IPv4 address. Nothing was sent."
+        }
+
+        $candidates += [pscustomobject]@{
+            Ssid = $ssid
+            Bssid = $bssid
+            InterfaceName = $interface.Name
+            InterfaceIndex = $properties.GetIPv4Properties().Index
+            LocalAddress = $addressEntry.Address
+        }
+    }
+
+    if ($candidates.Count -ne 1) {
+        $detected = if ($seenSsids.Count -gt 0) { $seenSsids -join ', ' } else { '(none)' }
+        throw "Exactly one active wireless interface must be connected to '$ExpectedSsidDisplay'. Detected Wi-Fi: $detected. Nothing was sent."
+    }
+    return $candidates[0]
+}
+
+function New-Crc8Table {
+    [byte[]]$table = New-Object byte[] 256
+    for ($i = 0; $i -lt 256; $i++) {
+        $remainder = 0
+        $inputValue = $i
+        for ($bit = 0; $bit -lt 8; $bit++) {
+            if ((($inputValue -bxor $remainder) -band 1) -eq 1) {
+                $remainder = ((($remainder -bxor 24) -shr 1) -bor 128)
+            }
+            else {
+                $remainder = $remainder -shr 1
+            }
+            $inputValue = $inputValue -shr 1
+        }
+        $table[$i] = [byte]($remainder -band 0xFF)
+    }
+    return ,$table
+}
+
+$script:Crc8Table = New-Crc8Table
+
+function Get-Crc8 {
+    param(
+        [byte[]]$Data,
+        [int]$Offset,
+        [int]$Length
+    )
+    $seed = 0
+    for ($i = 0; $i -lt $Length; $i++) {
+        $seed = $script:Crc8Table[($seed -bxor $Data[$Offset + $i]) -band 0xFF]
+    }
+    return [byte]($seed -band 0xFF)
+}
+
+function Get-TwosComplementChecksum {
+    param(
+        [byte[]]$Data,
+        [int]$Start,
+        [int]$EndExclusive
+    )
+    $sum = 0
+    for ($i = $Start; $i -lt $EndExclusive; $i++) {
+        $sum += $Data[$i]
+    }
+    return [byte](((-bnot $sum) + 1) -band 0xFF)
+}
+
+function New-ReadOnlySnPacket {
+    param([byte]$Counter)
+
+    [byte[]]$body = New-Object byte[] 37
+    $body[0] = 0xAA
+    $body[1] = 36
+    $body[2] = 0xAC
+    [byte[]]$fixed = @(0, 0, 0, 0, 0, 1, 0x0F, 0x80)
+    [Buffer]::BlockCopy($fixed, 0, $body, 3, $fixed.Length)
+
+    $body[11] = 0x40
+
+    $body[34] = $Counter
+    $body[35] = Get-Crc8 -Data $body -Offset 10 -Length 25
+    $body[36] = Get-TwosComplementChecksum -Data $body -Start 1 -EndExclusive 36
+    return ,$body
+}
+
+function New-TargetWriteInnerPacket {
+    param([byte]$Counter)
+
+    [byte[]]$body = New-ReadOnlySnPacket -Counter $Counter
+    $body[11] = 0x41
+    [Buffer]::BlockCopy($TargetEncodedSn, 0, $body, 12, $TargetEncodedSn.Length)
+    $body[35] = Get-Crc8 -Data $body -Offset 10 -Length 25
+    $body[36] = Get-TwosComplementChecksum -Data $body -Start 1 -EndExclusive 36
+    return ,$body
+}
+
+function Invoke-AesEcb {
+    param(
+        [byte[]]$Data,
+        [bool]$Encrypt
+    )
+
+    $aes = [Security.Cryptography.Aes]::Create()
+    $aes.Mode = [Security.Cryptography.CipherMode]::ECB
+    $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+    $aes.Key = [Text.Encoding]::UTF8.GetBytes($AesKeyText)
+    $transform = if ($Encrypt) { $aes.CreateEncryptor() } else { $aes.CreateDecryptor() }
+    try {
+        [byte[]]$result = $transform.TransformFinalBlock($Data, 0, $Data.Length)
+        return ,$result
+    }
+    finally {
+        $transform.Dispose()
+        $aes.Dispose()
+    }
+}
+
+function New-TransportPacket {
+    param(
+        [byte[]]$InnerBody,
+        [uint32]$MessageId
+    )
+
+    [byte[]]$cipher = Invoke-AesEcb -Data $InnerBody -Encrypt $true
+    $totalLength = 4 + 2 + 2 + 4 + 28 + $cipher.Length + 16
+    [byte[]]$packet = New-Object byte[] $totalLength
+    $packet[0] = 0x5A
+    $packet[1] = 0x5A
+    $packet[2] = 0x01
+    $packet[3] = 0x00
+    $packet[4] = [byte]($totalLength -band 0xFF)
+    $packet[5] = [byte](($totalLength -shr 8) -band 0xFF)
+    $packet[6] = 0x20
+    $packet[7] = 0x00
+    $packet[8] = [byte]($MessageId -band 0xFF)
+    $packet[9] = [byte](($MessageId -shr 8) -band 0xFF)
+    $packet[10] = [byte](($MessageId -shr 16) -band 0xFF)
+    $packet[11] = [byte](($MessageId -shr 24) -band 0xFF)
+    [Buffer]::BlockCopy($cipher, 0, $packet, 40, $cipher.Length)
+    return ,$packet
+}
+
+function Read-ExactBytes {
+    param(
+        [System.Net.Sockets.NetworkStream]$Stream,
+        [int]$Count,
+        [int]$TimeoutMs
+    )
+
+    [byte[]]$buffer = New-Object byte[] $Count
+    $offset = 0
+    $Stream.ReadTimeout = $TimeoutMs
+    while ($offset -lt $Count) {
+        try {
+            $read = $Stream.Read($buffer, $offset, $Count - $offset)
+        }
+        catch [System.IO.IOException] {
+            return $null
+        }
+        if ($read -le 0) {
+            return $null
+        }
+        $offset += $read
+    }
+    return ,$buffer
+}
+
+function Read-MideaFrame {
+    param(
+        [System.Net.Sockets.NetworkStream]$Stream,
+        [int]$TimeoutMs = 1000
+    )
+
+    [byte[]]$header = Read-ExactBytes -Stream $Stream -Count 6 -TimeoutMs $TimeoutMs
+    if ($null -eq $header) {
+        return $null
+    }
+    if ($header[0] -ne 0x5A -or $header[1] -ne 0x5A -or $header[2] -ne 0x01 -or $header[3] -ne 0x00) {
+        throw "Unexpected response header: $(ConvertTo-Hex $header)"
+    }
+
+    $totalLength = $header[4] -bor ($header[5] -shl 8)
+    if ($totalLength -lt 56 -or $totalLength -gt 4096) {
+        throw "Invalid response length: $totalLength"
+    }
+
+    [byte[]]$rest = Read-ExactBytes -Stream $Stream -Count ($totalLength - 6) -TimeoutMs $TimeoutMs
+    if ($null -eq $rest) {
+        return $null
+    }
+    [byte[]]$frame = New-Object byte[] $totalLength
+    [Buffer]::BlockCopy($header, 0, $frame, 0, 6)
+    [Buffer]::BlockCopy($rest, 0, $frame, 6, $rest.Length)
+    return ,$frame
+}
+
+function Get-SnResponse {
+    param([byte[]]$Frame)
+
+    $messageType = $Frame[6] -bor ($Frame[7] -shl 8)
+    if (($messageType -band 0x7FFF) -ne 0x20) {
+        return $null
+    }
+
+    $cipherLength = $Frame.Length - 40 - 16
+    if ($cipherLength -le 0 -or ($cipherLength % 16) -ne 0) {
+        throw "Invalid encrypted response length: $cipherLength"
+    }
+    [byte[]]$cipher = New-Object byte[] $cipherLength
+    [Buffer]::BlockCopy($Frame, 40, $cipher, 0, $cipherLength)
+    [byte[]]$body = Invoke-AesEcb -Data $cipher -Encrypt $false
+
+    if ($body.Length -lt 12 -or $body[0] -ne 0xAA -or $body[2] -ne 0xAC) {
+        return $null
+    }
+    if (-not (Test-InnerPacketIntegrity -Body $body)) {
+        throw 'The appliance returned an SN packet with an invalid length, CRC, or checksum.'
+    }
+
+    return [pscustomobject]@{
+        Command = $body[11]
+        Body = $body
+    }
+}
+
+function Test-InnerPacketIntegrity {
+    param([byte[]]$Body)
+
+    if ($Body.Length -ne 37 -or $Body[1] -ne 36 -or $Body.Length -ne ($Body[1] + 1)) {
+        return $false
+    }
+    if ($Body[2] -ne 0xAC -or $Body[9] -ne 0x0F -or $Body[10] -ne 0x80) {
+        return $false
+    }
+    if ($Body[11] -notin @(0x40, 0x41)) {
+        return $false
+    }
+    $sum = 0
+    for ($i = 1; $i -lt $Body.Length; $i++) {
+        $sum += $Body[$i]
+    }
+    if (($sum -band 0xFF) -ne 0) {
+        return $false
+    }
+    if ((Get-Crc8 -Data $Body -Offset 10 -Length 25) -ne $Body[35]) {
+        return $false
+    }
+    return $true
+}
+
+function Test-TargetSnResponse {
+    param([byte[]]$Body)
+
+    if ($Body.Length -lt 34 -or $Body[11] -ne 0x40) {
+        return $false
+    }
+    for ($i = 0; $i -lt $TargetEncodedSn.Length; $i++) {
+        if ($Body[12 + $i] -ne $TargetEncodedSn[$i]) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Send-Packet {
+    param(
+        [System.Net.Sockets.NetworkStream]$Stream,
+        [byte[]]$Packet,
+        [ref]$WriteRequestSent = $null
+    )
+    if ($null -ne $WriteRequestSent) {
+        # Set immediately before NetworkStream.Write. Any exception after this
+        # point is conservatively a possible partial or complete write.
+        $WriteRequestSent.Value = $true
+    }
+    $Stream.Write($Packet, 0, $Packet.Length)
+    $Stream.Flush()
+}
+
+function Wait-ForReadResponse {
+    param(
+        [System.Net.Sockets.NetworkStream]$Stream,
+        [int]$TimeoutSeconds = 5
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        [byte[]]$frame = Read-MideaFrame -Stream $Stream -TimeoutMs 1000
+        if ($null -eq $frame) {
+            continue
+        }
+        $response = Get-SnResponse -Frame $frame
+        if ($null -eq $response) {
+            continue
+        }
+        if ($response.Command -eq 0x41) {
+            Write-Host 'Write acknowledgement received; waiting for read-back.' -ForegroundColor DarkGray
+            continue
+        }
+        if ($response.Command -eq 0x40) {
+            return $response.Body
+        }
+    }
+    return $null
+}
+
+function Receive-RawWindow {
+    param(
+        [System.Net.Sockets.NetworkStream]$Stream,
+        [System.Net.Sockets.Socket]$Socket,
+        [int]$TimeoutSeconds
+    )
+
+    $bytes = New-Object 'System.Collections.Generic.List[byte]'
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $remoteClosed = $false
+    $truncated = $false
+    $readError = $null
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if ($Stream.DataAvailable) {
+            [byte[]]$buffer = New-Object byte[] 4096
+            $Stream.ReadTimeout = 1000
+            try {
+                $read = $Stream.Read($buffer, 0, $buffer.Length)
+            }
+            catch [System.IO.IOException] {
+                $readError = $_.Exception.Message
+                break
+            }
+            if ($read -le 0) {
+                $remoteClosed = $true
+                break
+            }
+            $remainingCapacity = 65536 - $bytes.Count
+            $copyLength = [Math]::Min($read, $remainingCapacity)
+            for ($i = 0; $i -lt $copyLength; $i++) {
+                $bytes.Add($buffer[$i])
+            }
+            if ($copyLength -lt $read -or $bytes.Count -ge 65536) {
+                $truncated = $true
+                break
+            }
+            continue
+        }
+
+        if ($Socket.Poll(1000, [System.Net.Sockets.SelectMode]::SelectRead) -and $Socket.Available -eq 0) {
+            $remoteClosed = $true
+            break
+        }
+        Start-Sleep -Milliseconds 50
+    }
+
+    return [pscustomobject]@{
+        Bytes = $bytes.ToArray()
+        RemoteClosed = $remoteClosed
+        Truncated = $truncated
+        ReadError = $readError
+    }
+}
+
+function Show-RawDiagnostic {
+    param([byte[]]$Raw)
+
+    Write-Host "RAW_RECEIVED_BYTES=$($Raw.Length)"
+    if ($Raw.Length -eq 0) {
+        return
+    }
+    Write-Host "RAW_HEX=$(ConvertTo-Hex $Raw)"
+
+    $offset = 0
+    $frameNumber = 0
+    while ($offset -lt $Raw.Length) {
+        $magic = -1
+        for ($i = $offset; $i -lt ($Raw.Length - 1); $i++) {
+            if ($Raw[$i] -eq 0x5A -and $Raw[$i + 1] -eq 0x5A) {
+                $magic = $i
+                break
+            }
+        }
+        if ($magic -lt 0) {
+            if (($Raw.Length - $offset) -eq 1 -and $Raw[$offset] -eq 0x5A) {
+                Write-Host 'PARTIAL_HEADER_BYTES=1/6 HEX=5A' -ForegroundColor Yellow
+            }
+            else {
+                Write-Host "UNFRAMED_TAIL_BYTES=$($Raw.Length - $offset)" -ForegroundColor Yellow
+            }
+            break
+        }
+        if ($magic -gt $offset) {
+            Write-Host "UNFRAMED_PREFIX_BYTES=$($magic - $offset)" -ForegroundColor Yellow
+        }
+        if (($Raw.Length - $magic) -lt 6) {
+            Write-Host "PARTIAL_HEADER_BYTES=$($Raw.Length - $magic)" -ForegroundColor Yellow
+            break
+        }
+
+        $totalLength = $Raw[$magic + 4] -bor ($Raw[$magic + 5] -shl 8)
+        if ($totalLength -lt 12 -or $totalLength -gt 4096) {
+            Write-Host "INVALID_FRAME_LENGTH=$totalLength OFFSET=$magic" -ForegroundColor Yellow
+            $offset = $magic + 2
+            continue
+        }
+        if (($Raw.Length - $magic) -lt $totalLength) {
+            Write-Host "PARTIAL_FRAME_EXPECTED=$totalLength AVAILABLE=$($Raw.Length - $magic)" -ForegroundColor Yellow
+            break
+        }
+
+        $frameNumber++
+        [byte[]]$frame = New-Object byte[] $totalLength
+        [Buffer]::BlockCopy($Raw, $magic, $frame, 0, $totalLength)
+        $messageType = $frame[6] -bor ($frame[7] -shl 8)
+        $messageId = [BitConverter]::ToUInt32($frame, 8)
+        Write-Host "FRAME_${frameNumber}: LENGTH=$totalLength TYPE=0x$($messageType.ToString('X4')) MSGID=$messageId"
+
+        $cipherLength = $totalLength - 40 - 16
+        if (($messageType -band 0x7FFF) -eq 0x20 -and $cipherLength -gt 0 -and ($cipherLength % 16) -eq 0) {
+            [byte[]]$cipher = New-Object byte[] $cipherLength
+            [Buffer]::BlockCopy($frame, 40, $cipher, 0, $cipherLength)
+            try {
+                [byte[]]$body = Invoke-AesEcb -Data $cipher -Encrypt $false
+                Write-Host "FRAME_${frameNumber}_DECRYPTED=$(ConvertTo-Hex $body)"
+                if ($body.Length -ge 12) {
+                    $declaredBodyLength = $body[1] + 1
+                    Write-Host "FRAME_${frameNumber}_BODY: ACTUAL=$($body.Length) DECLARED=$declaredBodyLength MAGIC=0x$($body[0].ToString('X2')) DEVICE=0x$($body[2].ToString('X2')) B9=0x$($body[9].ToString('X2')) B10=0x$($body[10].ToString('X2')) COMMAND=0x$($body[11].ToString('X2'))"
+                    $sum = 0
+                    for ($j = 1; $j -lt $body.Length; $j++) {
+                        $sum += $body[$j]
+                    }
+                    Write-Host "FRAME_${frameNumber}_CHECKSUM_OK=$((($sum -band 0xFF) -eq 0))"
+                    if ($body.Length -ge 14) {
+                        $crcIndex = $body.Length - 2
+                        $crcLength = $body.Length - 12
+                        $calculatedCrc = Get-Crc8 -Data $body -Offset 10 -Length $crcLength
+                        Write-Host "FRAME_${frameNumber}_CRC: INDEX=$crcIndex RECEIVED=0x$($body[$crcIndex].ToString('X2')) CALCULATED=0x$($calculatedCrc.ToString('X2')) OK=$($body[$crcIndex] -eq $calculatedCrc)"
+                    }
+                    if ($body.Length -ge 34 -and $body[2] -eq 0xAC -and $body[11] -ne 0x41) {
+                        $targetMatch = $true
+                        for ($j = 0; $j -lt 22; $j++) {
+                            if ($body[12 + $j] -ne $TargetEncodedSn[$j]) {
+                                $targetMatch = $false
+                                break
+                            }
+                        }
+                        Write-Host "FRAME_${frameNumber}_TARGET_SN_MATCH=$targetMatch"
+                    }
+                }
+            }
+            catch {
+                Write-Host "FRAME_${frameNumber}_DECRYPT_ERROR=$($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
+        $offset = $magic + $totalLength
+    }
+}
+
+function Assert-ReadOnlyDiagnosticPacket {
+    param(
+        [byte[]]$Inner,
+        [byte[]]$Packet
+    )
+
+    if ($Inner.Length -ne 37 -or $Inner[11] -ne 0x40 -or -not (Test-InnerPacketIntegrity -Body $Inner)) {
+        throw 'Diagnostic safety check failed: the inner packet is not a valid read-only SN query.'
+    }
+    for ($i = 12; $i -le 33; $i++) {
+        if ($Inner[$i] -ne 0) {
+            throw 'Diagnostic safety check failed: the read-only SN payload is not empty.'
+        }
+    }
+    if ($Packet.Length -ne 104 -or $Packet[0] -ne 0x5A -or $Packet[1] -ne 0x5A) {
+        throw 'Diagnostic safety check failed: unexpected transport packet.'
+    }
+    $declaredLength = $Packet[4] -bor ($Packet[5] -shl 8)
+    $messageType = $Packet[6] -bor ($Packet[7] -shl 8)
+    if ($declaredLength -ne $Packet.Length -or $messageType -ne 0x20) {
+        throw 'Diagnostic safety check failed: unexpected transport length or type.'
+    }
+    [byte[]]$cipher = New-Object byte[] 48
+    [Buffer]::BlockCopy($Packet, 40, $cipher, 0, 48)
+    [byte[]]$decrypted = Invoke-AesEcb -Data $cipher -Encrypt $false
+    if ((ConvertTo-Hex $decrypted) -ne (ConvertTo-Hex $Inner)) {
+        throw 'Diagnostic safety check failed: transport decryption does not match the read-only query.'
+    }
+}
+
+function Assert-TargetWritePacket {
+    param(
+        [byte[]]$Inner,
+        [byte[]]$Packet
+    )
+
+    if ($Inner.Length -ne 37 -or $Inner[11] -ne 0x41 -or $Inner[34] -ne 1 -or -not (Test-InnerPacketIntegrity -Body $Inner)) {
+        throw 'Write safety check failed: invalid write command, sequence, CRC, or checksum.'
+    }
+    for ($i = 0; $i -lt 22; $i++) {
+        if ($Inner[12 + $i] -ne $TargetEncodedSn[$i]) {
+            throw 'Write safety check failed: payload is not the locked target SN.'
+        }
+    }
+    if ($Packet.Length -ne 104 -or $Packet[0] -ne 0x5A -or $Packet[1] -ne 0x5A) {
+        throw 'Write safety check failed: unexpected transport packet.'
+    }
+    $declaredLength = $Packet[4] -bor ($Packet[5] -shl 8)
+    $messageType = $Packet[6] -bor ($Packet[7] -shl 8)
+    $messageId = [BitConverter]::ToUInt32($Packet, 8)
+    if ($declaredLength -ne 104 -or $messageType -ne 0x20 -or $messageId -ne 0) {
+        throw 'Write safety check failed: write must be the first transport message.'
+    }
+    [byte[]]$cipher = New-Object byte[] 48
+    [Buffer]::BlockCopy($Packet, 40, $cipher, 0, 48)
+    [byte[]]$decrypted = Invoke-AesEcb -Data $cipher -Encrypt $false
+    if ((ConvertTo-Hex $decrypted) -ne (ConvertTo-Hex $Inner)) {
+        throw 'Write safety check failed: encrypted payload does not match the locked write command.'
+    }
+}
+
+function Add-RawCapture {
+    param(
+        [System.Collections.Generic.List[byte]]$Destination,
+        [byte[]]$Bytes
+    )
+
+    if (($Destination.Count + $Bytes.Length) -gt 65536) {
+        throw 'Response capture exceeded the 64 KiB safety limit.'
+    }
+    foreach ($value in $Bytes) {
+        $Destination.Add($value)
+    }
+}
+
+function ConvertFrom-EncodedBodySn {
+    param([byte[]]$Encoded)
+
+    if ($null -eq $Encoded -or $Encoded.Length -ne 22) {
+        throw 'Encoded body SN must contain exactly 22 bytes.'
+    }
+
+    [byte[]]$s1 = @(
+        0x05,0x24,0x21,0x27,0x03,0x10,0x35,0x14,0x16,0x3B,0x11,0x23,0x26,0x06,0x3E,0x33,
+        0x1C,0x13,0x30,0x28,0x3F,0x3A,0x0E,0x2A,0x1D,0x22,0x1A,0x3C,0x07,0x31,0x0A,0x19,
+        0x36,0x0F,0x2E,0x08,0x1F,0x12,0x32,0x2C,0x2D,0x25,0x09,0x01,0x0B,0x0C,0x15,0x04,
+        0x0D,0x00,0x18,0x34,0x3D,0x39,0x38,0x20,0x2F,0x37,0x2B,0x29,0x17,0x1B,0x1E,0x02
+    )
+    [byte[]]$s2 = @(
+        0x39,0x31,0x29,0x21,0x19,0x11,0x09,0x01,0x3B,0x33,0x2B,0x23,0x1B,0x13,0x0B,0x03,
+        0x3D,0x35,0x2D,0x25,0x1D,0x15,0x0D,0x05,0x3F,0x37,0x2F,0x27,0x1F,0x17,0x0F,0x07,
+        0x38,0x30,0x28,0x20,0x18,0x10,0x08,0x00,0x3A,0x32,0x2A,0x22,0x1A,0x12,0x0A,0x02,
+        0x3C,0x34,0x2C,0x24,0x1C,0x14,0x0C,0x04,0x3E,0x36,0x2E,0x26,0x1E,0x16,0x0E,0x06
+    )
+    [int[]]$inverseS1 = New-Object int[] 64
+    [int[]]$inverseS2 = New-Object int[] 64
+    for ($i = 0; $i -lt 64; $i++) {
+        $inverseS1[$s1[$i]] = $i
+        $inverseS2[$s2[$i]] = $i
+    }
+
+    [int]$firstDigit = [int]$Encoded[0] - 36
+    [int]$lastDigit = [int]$Encoded[21]
+    if ($firstDigit -lt 0 -or $firstDigit -gt 9 -or $lastDigit -lt 0 -or $lastDigit -gt 9) {
+        throw 'Encoded body SN boundary digits are invalid.'
+    }
+
+    [int[]]$positions = switch ($lastDigit) {
+        0 { @(18,4,6,8,10,12,17,0,7,9,14,13,3,16,5,19,11,15,1,2) }
+        1 { @(5,17,0,19,10,11,18,6,2,13,4,3,14,15,9,12,1,7,16,8) }
+        2 { @(1,3,10,7,0,6,4,18,12,8,15,2,17,16,9,11,19,5,14,13) }
+        3 { @(7,17,1,16,19,18,2,13,4,5,6,9,11,14,8,15,3,10,12,0) }
+        4 { @(10,16,8,7,18,9,0,2,11,13,3,17,6,5,4,19,14,1,12,15) }
+        5 { @(5,4,6,12,8,3,14,17,9,2,19,18,15,1,7,13,0,10,11,16) }
+        6 { @(10,18,3,1,15,0,4,16,7,14,8,6,19,9,5,2,13,17,12,11) }
+        7 { @(10,19,16,6,2,5,14,17,9,1,15,13,11,8,4,3,0,7,18,12) }
+        8 { @(12,7,11,14,18,3,8,6,4,13,2,17,5,16,9,15,0,1,10,19) }
+        9 { @(18,13,15,2,3,7,16,0,19,1,11,8,17,14,10,9,5,12,4,6) }
+    }
+    if ($positions.Length -ne 20) {
+        throw 'Encoded body SN selected an invalid position row.'
+    }
+
+    [int[]]$digits = New-Object int[] 22
+    $digits[0] = $firstDigit
+    $digits[21] = $lastDigit
+    for ($i = 0; $i -lt 20; $i++) {
+        [int]$encodedIndex = 1 + $positions[$i]
+        [int]$s2Output = [int]$Encoded[$encodedIndex]
+        if ($s2Output -lt 0 -or $s2Output -gt 63) {
+            throw 'Encoded body SN contains an out-of-domain substitution byte.'
+        }
+        [int]$s1Output = $inverseS2[$s2Output]
+        [int]$digit = $inverseS1[$s1Output]
+        if ($digit -lt 0 -or $digit -gt 9) {
+            throw 'Encoded body SN does not decode to an ASCII digit.'
+        }
+        $digits[$i + 1] = $digit
+    }
+
+    $builder = New-Object System.Text.StringBuilder
+    foreach ($digit in $digits) {
+        [void]$builder.Append([char](0x30 + $digit))
+    }
+    return $builder.ToString()
+}
+
+function Get-StrictSnFramesFromRaw {
+    param(
+        [byte[]]$Raw,
+        [uint32[]]$AllowedReadMessageIds = @()
+    )
+
+    $reads = New-Object 'System.Collections.Generic.List[object]'
+    $issues = New-Object 'System.Collections.Generic.List[string]'
+    $ackCount = 0
+    $completeFrames = 0
+    $offset = 0
+
+    while ($offset -lt $Raw.Length) {
+        $remaining = $Raw.Length - $offset
+        if ($remaining -lt 6) {
+            $issues.Add("PARTIAL_HEADER offset=$offset bytes=$remaining")
+            break
+        }
+        if ($Raw[$offset] -ne 0x5A -or $Raw[$offset + 1] -ne 0x5A -or $Raw[$offset + 2] -ne 0x01 -or $Raw[$offset + 3] -ne 0x00) {
+            $issues.Add("UNKNOWN_PREFIX offset=$offset")
+            $nextMagic = -1
+            for ($i = $offset + 1; $i -lt ($Raw.Length - 3); $i++) {
+                if ($Raw[$i] -eq 0x5A -and $Raw[$i + 1] -eq 0x5A -and $Raw[$i + 2] -eq 0x01 -and $Raw[$i + 3] -eq 0x00) {
+                    $nextMagic = $i
+                    break
+                }
+            }
+            if ($nextMagic -lt 0) {
+                break
+            }
+            $offset = $nextMagic
+            continue
+        }
+
+        $totalLength = $Raw[$offset + 4] -bor ($Raw[$offset + 5] -shl 8)
+        if ($totalLength -lt 56 -or $totalLength -gt 4096) {
+            $issues.Add("INVALID_LENGTH offset=$offset length=$totalLength")
+            break
+        }
+        if ($remaining -lt $totalLength) {
+            $issues.Add("PARTIAL_FRAME offset=$offset available=$remaining expected=$totalLength")
+            break
+        }
+
+        [byte[]]$frame = New-Object byte[] $totalLength
+        [Buffer]::BlockCopy($Raw, $offset, $frame, 0, $totalLength)
+        $completeFrames++
+        $messageType = $frame[6] -bor ($frame[7] -shl 8)
+        $messageId = [BitConverter]::ToUInt32($frame, 8)
+        if (($messageType -band 0x7FFF) -ne 0x20) {
+            $offset += $totalLength
+            continue
+        }
+
+        $cipherLength = $totalLength - 56
+        if ($cipherLength -le 0 -or ($cipherLength % 16) -ne 0) {
+            $issues.Add("INVALID_CIPHER_LENGTH msgid=$messageId length=$cipherLength")
+            $offset += $totalLength
+            continue
+        }
+        [byte[]]$cipher = New-Object byte[] $cipherLength
+        [Buffer]::BlockCopy($frame, 40, $cipher, 0, $cipherLength)
+        try {
+            [byte[]]$body = Invoke-AesEcb -Data $cipher -Encrypt $false
+        }
+        catch {
+            $issues.Add("DECRYPT_ERROR msgid=$messageId")
+            $offset += $totalLength
+            continue
+        }
+
+        $valid = $body.Length -ge 37 -and $body.Length -eq ($body[1] + 1)
+        $valid = $valid -and $body[0] -eq 0xAA -and $body[2] -eq 0xAC -and $body[9] -eq 0x0F -and $body[10] -eq 0x80
+        if ($valid) {
+            $sum = 0
+            for ($i = 1; $i -lt $body.Length; $i++) {
+                $sum += $body[$i]
+            }
+            $valid = (($sum -band 0xFF) -eq 0)
+        }
+        if ($valid) {
+            $crcIndex = $body.Length - 2
+            $calculatedCrc = Get-Crc8 -Data $body -Offset 10 -Length ($body.Length - 12)
+            $valid = ($body[$crcIndex] -eq $calculatedCrc)
+        }
+        if (-not $valid) {
+            $issues.Add("INVALID_SN_BODY msgid=$messageId")
+            $offset += $totalLength
+            continue
+        }
+
+        if ($body[11] -eq 0x41) {
+            $ackCount++
+        }
+        elseif ($body[11] -in @(0x40, 0xC0)) {
+            # The official receiver does not correlate response message IDs, and
+            # some firmware sets the response bit on the command/type. Keep ID
+            # correlation as a diagnostic only; integrity plus an exact 22-byte
+            # target match remains the success gate.
+            $messageIdWasExpected = $AllowedReadMessageIds -contains [uint32]$messageId
+            if (-not $messageIdWasExpected) {
+                $issues.Add("UNEXPECTED_READ_MSGID msgid=$messageId")
+            }
+            [byte[]]$encodedPayload = New-Object byte[] 22
+            [Buffer]::BlockCopy($body, 12, $encodedPayload, 0, 22)
+            try {
+                [string]$decodedSn = ConvertFrom-EncodedBodySn -Encoded $encodedPayload
+            }
+            catch {
+                $issues.Add("INVALID_SN_ENCODING msgid=$messageId")
+                $offset += $totalLength
+                continue
+            }
+            $matchesTarget = ($decodedSn -ceq $TargetSn)
+            $reads.Add([pscustomobject]@{
+                MessageId = [uint32]$messageId
+                MessageIdWasExpected = $messageIdWasExpected
+                Command = [byte]$body[11]
+                MatchesTarget = $matchesTarget
+                DecodedSn = $decodedSn
+                EncodedPayloadHex = ConvertTo-Hex $encodedPayload
+                Body = $body
+            })
+        }
+        else {
+            $issues.Add("UNKNOWN_SN_COMMAND msgid=$messageId command=0x$($body[11].ToString('X2'))")
+        }
+        $offset += $totalLength
+    }
+
+    return [pscustomobject]@{
+        Reads = $reads.ToArray()
+        AckCount = $ackCount
+        Issues = $issues.ToArray()
+        CompleteFrames = $completeFrames
+    }
+}
+
+function New-PersistentWriteAttemptLock {
+    [System.IO.Directory]::CreateDirectory($WriteAttemptLockDirectory) | Out-Null
+    if (Test-Path -LiteralPath $WriteAttemptLockPath) {
+        throw "WRITE_MODE_PERMANENTLY_BLOCKED: a prior write-attempt record already exists at '$WriteAttemptLockPath'. No network write was sent by this run."
+    }
+    if (Test-Path -LiteralPath $PackageWriteAttemptMarkerPath) {
+        throw "WRITE_MODE_PERMANENTLY_BLOCKED: this extracted package already contains '$PackageWriteAttemptMarkerPath'. No network write was sent by this run."
+    }
+
+    $createdUtc = [DateTime]::UtcNow.ToString('o')
+    $record = [ordered]@{
+        schema = 'midea-sn-write-lock/v2'
+        event = 'WRITE_RESERVED'
+        incidentId = $IncidentId
+        targetSn = $TargetSn
+        expectedSsid = $ExpectedSsidDisplay
+        expectedBssid = $ExpectedBssid
+        model = $TargetModel
+        snSource = $SnEvidenceSource
+        packageGeneratedUtc = $GeneratedUtc
+        lockCreatedUtc = $createdUtc
+        processId = $PID
+        permanentWriteBlock = $true
+        instruction = 'Never run Write mode again for this incident. Use only Query or Diagnostic.'
+    } | ConvertTo-Json -Compress
+    $record += [Environment]::NewLine
+
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [byte[]]$recordBytes = $encoding.GetBytes($record)
+    foreach ($markerPath in @($WriteAttemptLockPath, $PackageWriteAttemptMarkerPath)) {
+        $file = $null
+        try {
+            $file = New-Object System.IO.FileStream(
+                $markerPath,
+                [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::Read
+            )
+            $file.Write($recordBytes, 0, $recordBytes.Length)
+            $file.Flush($true)
+        }
+        catch [System.IO.IOException] {
+            throw "WRITE_MODE_PERMANENTLY_BLOCKED: another process or prior run created '$markerPath'. No network write was sent by this run."
+        }
+        finally {
+            if ($null -ne $file) {
+                $file.Dispose()
+            }
+        }
+    }
+}
+
+function Ensure-KnownPriorWriteAttemptMarker {
+    if ($KnownPriorWriteAttempt) {
+        throw 'Package invariant failed: a generated future-event package must not embed a prior write attempt.'
+    }
+}
+
+function Save-ZeroBytesDiagnosticReceipt {
+    $record = [ordered]@{
+        schema = 'midea-sn-zero-bytes-diagnostic/v1'
+        incidentId = $IncidentId
+        targetSn = $TargetSn
+        expectedSsid = $ExpectedSsidDisplay
+        observedUtc = [DateTime]::UtcNow.ToString('o')
+        rawReceivedBytes = 0
+        warning = 'Zero response bytes do not prove that the replacement board is blank.'
+    } | ConvertTo-Json -Compress
+    $record += [Environment]::NewLine
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [byte[]]$bytes = $encoding.GetBytes($record)
+    $file = New-Object System.IO.FileStream(
+        $DiagnosticReceiptPath,
+        [System.IO.FileMode]::Create,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::Read
+    )
+    try {
+        $file.Write($bytes, 0, $bytes.Length)
+        $file.Flush($true)
+    }
+    finally {
+        $file.Dispose()
+    }
+}
+
+function Assert-ZeroBytesDiagnosticReceipt {
+    if (-not (Test-Path -LiteralPath $DiagnosticReceiptPath)) {
+        throw "WRITE_PREFLIGHT_BLOCKED: first run the raw read-only diagnostic for this package. A matching zero-byte receipt is required at '$DiagnosticReceiptPath'."
+    }
+    try {
+        $receipt = Get-Content -LiteralPath $DiagnosticReceiptPath -Raw | ConvertFrom-Json
+    }
+    catch {
+        throw 'WRITE_PREFLIGHT_BLOCKED: the diagnostic receipt is unreadable. Rerun the read-only diagnostic; do not edit the receipt.'
+    }
+    if (
+        $receipt.schema -cne 'midea-sn-zero-bytes-diagnostic/v1' -or
+        $receipt.incidentId -cne $IncidentId -or
+        $receipt.targetSn -cne $TargetSn -or
+        $receipt.expectedSsid -cne $ExpectedSsidDisplay -or
+        [int]$receipt.rawReceivedBytes -ne 0
+    ) {
+        throw 'WRITE_PREFLIGHT_BLOCKED: the diagnostic receipt does not match this immutable target and incident.'
+    }
+}
+
+function New-PermanentReadStop {
+    param(
+        [ValidateSet('ALREADY_CORRECT', 'MISMATCH', 'INVALID_ENCODING')]
+        [string]$State,
+        [string]$EncodedReadback = ''
+    )
+
+    if ($State -ceq 'ALREADY_CORRECT') {
+        $globalPath = $AlreadyCorrectGlobalPath
+        $packagePath = $AlreadyCorrectPackagePath
+        $instruction = 'Target SN is already present. Never enter Write mode for this incident.'
+    }
+    elseif ($State -ceq 'MISMATCH') {
+        $globalPath = $MismatchGlobalPath
+        $packagePath = $MismatchPackagePath
+        $instruction = 'A valid non-target SN was read. Never enter Write mode; obtain authorized service review.'
+    }
+    else {
+        $globalPath = $InvalidEncodingGlobalPath
+        $packagePath = $InvalidEncodingPackagePath
+        $instruction = 'An integrity-checked reply contained an undecodable SN payload. Never enter Write mode; obtain authorized service review.'
+    }
+    $record = ([ordered]@{
+        schema = 'midea-sn-permanent-read-stop/v1'
+        state = $State
+        incidentId = $IncidentId
+        targetSn = $TargetSn
+        expectedSsid = $ExpectedSsidDisplay
+        encodedReadback = $EncodedReadback
+        observedUtc = [DateTime]::UtcNow.ToString('o')
+        permanentWriteStop = $true
+        instruction = $instruction
+    } | ConvertTo-Json -Compress) + [Environment]::NewLine
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [byte[]]$bytes = $encoding.GetBytes($record)
+    $errors = New-Object 'System.Collections.Generic.List[string]'
+
+    # Try the package marker and the global marker independently so one failure
+    # does not prevent the other location from being recorded. Both are required.
+    foreach ($markerPath in @($packagePath, $globalPath)) {
+        if (Test-Path -LiteralPath $markerPath) {
+            continue
+        }
+        $file = $null
+        try {
+            if ($markerPath -ceq $globalPath) {
+                [System.IO.Directory]::CreateDirectory($WriteAttemptLockDirectory) | Out-Null
+            }
+            $file = New-Object System.IO.FileStream(
+                $markerPath,
+                [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::Read
+            )
+            $file.Write($bytes, 0, $bytes.Length)
+            $file.Flush($true)
+        }
+        catch {
+            if (-not (Test-Path -LiteralPath $markerPath)) {
+                $errors.Add("$markerPath :: $($_.Exception.Message)")
+            }
+        }
+        finally {
+            if ($null -ne $file) {
+                $file.Dispose()
+            }
+        }
+    }
+    $packageExists = Test-Path -LiteralPath $packagePath
+    $globalExists = Test-Path -LiteralPath $globalPath
+    if (-not $packageExists -or -not $globalExists) {
+        throw "Could not persist both required permanent read-only stop markers (PACKAGE=$packageExists GLOBAL=$globalExists): $($errors -join '; ')"
+    }
+}
+
+function Assert-NoPermanentReadStop {
+    foreach ($markerPath in @(
+        $AlreadyCorrectGlobalPath,
+        $AlreadyCorrectPackagePath,
+        $MismatchGlobalPath,
+        $MismatchPackagePath,
+        $InvalidEncodingGlobalPath,
+        $InvalidEncodingPackagePath
+    )) {
+        if (Test-Path -LiteralPath $markerPath) {
+            throw "WRITE_PREFLIGHT_BLOCKED: a permanent read-only stop exists at '$markerPath'. Do not write this incident."
+        }
+    }
+}
+
+function Add-PersistentWriteAttemptEvent {
+    param([string]$Event)
+
+    if (-not (Test-Path -LiteralPath $WriteAttemptLockPath) -or -not (Test-Path -LiteralPath $PackageWriteAttemptMarkerPath)) {
+        throw 'A persistent write-attempt marker disappeared. The write is blocked.'
+    }
+    $line = ([ordered]@{
+        schema = 'midea-sn-write-lock/v2'
+        event = $Event
+        eventUtc = [DateTime]::UtcNow.ToString('o')
+        incidentId = $IncidentId
+        processId = $PID
+    } | ConvertTo-Json -Compress) + [Environment]::NewLine
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [byte[]]$lineBytes = $encoding.GetBytes($line)
+    foreach ($markerPath in @($WriteAttemptLockPath, $PackageWriteAttemptMarkerPath)) {
+        $file = New-Object System.IO.FileStream(
+            $markerPath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::Read
+        )
+        try {
+            $null = $file.Seek(0, [System.IO.SeekOrigin]::End)
+            $file.Write($lineBytes, 0, $lineBytes.Length)
+            $file.Flush($true)
+        }
+        finally {
+            $file.Dispose()
+        }
+    }
+}
+
+function Send-SingleAuthorizedWrite {
+    param(
+        [System.Net.Sockets.NetworkStream]$Stream,
+        [string]$CurrentMode,
+        [bool]$Authorized,
+        [bool]$PersistentLockReserved,
+        [ref]$WriteRequestSent
+    )
+
+    if ($CurrentMode -ne 'Write' -or -not $Authorized -or -not $PersistentLockReserved -or $WriteRequestSent.Value) {
+        throw 'Write safety gate refused the request.'
+    }
+    [byte[]]$inner = New-TargetWriteInnerPacket -Counter 1
+    [byte[]]$packet = New-TransportPacket -InnerBody $inner -MessageId 0
+    Assert-TargetWritePacket -Inner $inner -Packet $packet
+
+    # The on-disk reservation was created before TCP. Record and flush the
+    # imminent send before touching the socket.
+    Add-PersistentWriteAttemptEvent -Event 'WRITE_SEND_ABOUT_TO_START'
+    Send-Packet -Stream $Stream -Packet $packet -WriteRequestSent $WriteRequestSent
+    Add-PersistentWriteAttemptEvent -Event 'LOCAL_SOCKET_WRITE_RETURNED'
+}
+
+function Assert-ReadOnlyProtocolSelfTest {
+    $expectedEncodedSn = '@@TARGET_ENCODED_HEX@@'
+    $expectedQueryInner = '@@QUERY1_INNER_HEX@@'
+    $expectedQueryCipher = '@@QUERY1_CIPHER_HEX@@'
+    $expectedQuery2Inner = '@@QUERY2_INNER_HEX@@'
+    $expectedQuery2Cipher = '@@QUERY2_CIPHER_HEX@@'
+    $expectedQuery3Cipher = '23 66 1F C7 96 4A 42 A1 5D 09 23 CC C6 0E 45 F8 35 C0 20 DB A1 85 B2 7A 2C E1 42 A7 2C B8 2D B1 78 8A 12 A1 64 14 5D A1 5E F2 17 C7 D2 2C E4 8C'
+    $expectedQuery4Cipher = '23 66 1F C7 96 4A 42 A1 5D 09 23 CC C6 0E 45 F8 35 C0 20 DB A1 85 B2 7A 2C E1 42 A7 2C B8 2D B1 3C C2 1B 6F 37 81 A2 99 44 25 DD AB 75 FA AD 26'
+    if ($TargetSn -notmatch '^[0-9]{22}$') {
+        throw 'Target identity self-test failed.'
+    }
+    if ($ExpectedSsidDisplay -notmatch '^midea_test_[0-9a-f]{12}$' -or (Normalize-Ssid $ExpectedSsidDisplay) -cne $ExpectedSsidNormalized) {
+        throw 'Target service-hotspot self-test failed.'
+    }
+    if ($ExpectedBssidRequired -and $ExpectedBssid -cnotmatch '^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$') {
+        throw 'Target BSSID self-test failed.'
+    }
+    if ([string]::IsNullOrWhiteSpace($TargetModel) -or [string]::IsNullOrWhiteSpace($SnEvidenceSource)) {
+        throw 'Target evidence metadata self-test failed.'
+    }
+    [Guid]$incidentGuid = [Guid]::Empty
+    if (-not [Guid]::TryParse($IncidentId, [ref]$incidentGuid) -or $incidentGuid -eq [Guid]::Empty) {
+        throw 'Physical-board incident ID self-test failed.'
+    }
+    if ($WriteConfirmationPhrase -cnotmatch '^WRITE-[0-9]{4}-[0-9A-F]{4}-[0-9A-F]{8}-ONCE$') {
+        throw 'Write confirmation phrase self-test failed.'
+    }
+    if ((ConvertTo-Hex $TargetEncodedSn) -ne $expectedEncodedSn) {
+        throw 'Target SN encoding self-test failed.'
+    }
+    [byte[]]$queryInner = New-ReadOnlySnPacket -Counter 1
+    if ((ConvertTo-Hex $queryInner) -ne $expectedQueryInner) {
+        throw 'Protocol self-test failed while building the query packet.'
+    }
+    [byte[]]$queryCipher = Invoke-AesEcb -Data $queryInner -Encrypt $true
+    if ((ConvertTo-Hex $queryCipher) -ne $expectedQueryCipher) {
+        throw 'Protocol self-test failed while encrypting the query packet.'
+    }
+    [byte[]]$queryTransport = New-TransportPacket -InnerBody $queryInner -MessageId 0
+    Assert-ReadOnlyDiagnosticPacket -Inner $queryInner -Packet $queryTransport
+
+    [byte[]]$query2Inner = New-ReadOnlySnPacket -Counter 2
+    if ((ConvertTo-Hex $query2Inner) -ne $expectedQuery2Inner) {
+        throw 'Protocol self-test failed while building the first post-write query.'
+    }
+    [byte[]]$query2Cipher = Invoke-AesEcb -Data $query2Inner -Encrypt $true
+    if ((ConvertTo-Hex $query2Cipher) -ne $expectedQuery2Cipher) {
+        throw 'Protocol self-test failed while encrypting the first post-write query.'
+    }
+    [byte[]]$query2Transport = New-TransportPacket -InnerBody $query2Inner -MessageId 1
+    Assert-ReadOnlyDiagnosticPacket -Inner $query2Inner -Packet $query2Transport
+
+    [byte[]]$query3Inner = New-ReadOnlySnPacket -Counter 3
+    [byte[]]$query3Cipher = Invoke-AesEcb -Data $query3Inner -Encrypt $true
+    if ((ConvertTo-Hex $query3Cipher) -ne $expectedQuery3Cipher) {
+        throw 'Protocol self-test failed while encrypting the second post-write query.'
+    }
+    [byte[]]$query3Transport = New-TransportPacket -InnerBody $query3Inner -MessageId 2
+    Assert-ReadOnlyDiagnosticPacket -Inner $query3Inner -Packet $query3Transport
+
+    [byte[]]$query4Inner = New-ReadOnlySnPacket -Counter 4
+    [byte[]]$query4Cipher = Invoke-AesEcb -Data $query4Inner -Encrypt $true
+    if ((ConvertTo-Hex $query4Cipher) -ne $expectedQuery4Cipher) {
+        throw 'Protocol self-test failed while encrypting the third post-write query.'
+    }
+    [byte[]]$query4Transport = New-TransportPacket -InnerBody $query4Inner -MessageId 3
+    Assert-ReadOnlyDiagnosticPacket -Inner $query4Inner -Packet $query4Transport
+
+    [byte[]]$syntheticRead = New-ReadOnlySnPacket -Counter 2
+    [Buffer]::BlockCopy($TargetEncodedSn, 0, $syntheticRead, 12, $TargetEncodedSn.Length)
+    $syntheticRead[35] = Get-Crc8 -Data $syntheticRead -Offset 10 -Length 25
+    $syntheticRead[36] = Get-TwosComplementChecksum -Data $syntheticRead -Start 1 -EndExclusive 36
+    [byte[]]$syntheticFrame = New-TransportPacket -InnerBody $syntheticRead -MessageId 1
+    $syntheticFrame[7] = 0x80
+    $syntheticResponse = Get-SnResponse -Frame $syntheticFrame
+    if ($null -eq $syntheticResponse -or -not (Test-TargetSnResponse -Body $syntheticResponse.Body)) {
+        throw 'Protocol self-test failed while parsing a read-back packet.'
+    }
+
+    $strictTarget = Get-StrictSnFramesFromRaw -Raw $syntheticFrame -AllowedReadMessageIds @([uint32]1)
+    if ($strictTarget.Reads.Count -ne 1 -or -not $strictTarget.Reads[0].MatchesTarget) {
+        throw 'Protocol self-test failed while strictly verifying a target read-back packet.'
+    }
+
+    [byte[]]$unexpectedIdFrame = New-TransportPacket -InnerBody $syntheticRead -MessageId 77
+    $unexpectedIdResult = Get-StrictSnFramesFromRaw -Raw $unexpectedIdFrame -AllowedReadMessageIds @([uint32]1)
+    if ($unexpectedIdResult.Reads.Count -ne 1 -or $unexpectedIdResult.Reads[0].MessageIdWasExpected -or -not $unexpectedIdResult.Reads[0].MatchesTarget) {
+        throw 'Protocol self-test failed: a firmware-generated response ID must be advisory, not a false rejection.'
+    }
+
+    [byte[]]$responseBitRead = $syntheticRead.Clone()
+    $responseBitRead[11] = 0xC0
+    $responseBitRead[35] = Get-Crc8 -Data $responseBitRead -Offset 10 -Length 25
+    $responseBitRead[36] = Get-TwosComplementChecksum -Data $responseBitRead -Start 1 -EndExclusive 36
+    [byte[]]$responseBitFrame = New-TransportPacket -InnerBody $responseBitRead -MessageId 1
+    $responseBitResult = Get-StrictSnFramesFromRaw -Raw $responseBitFrame -AllowedReadMessageIds @([uint32]1)
+    if ($responseBitResult.Reads.Count -ne 1 -or -not $responseBitResult.Reads[0].MatchesTarget) {
+        throw 'Protocol self-test failed while accepting the documented 0xC0 response-bit form.'
+    }
+
+    [byte[]]$invalidEncodingRead = New-ReadOnlySnPacket -Counter 2
+    [byte[]]$invalidEncodingFrame = New-TransportPacket -InnerBody $invalidEncodingRead -MessageId 1
+    $invalidEncodingResult = Get-StrictSnFramesFromRaw -Raw $invalidEncodingFrame -AllowedReadMessageIds @([uint32]1)
+    if ($invalidEncodingResult.Reads.Count -ne 0 -or -not ($invalidEncodingResult.Issues -match '^INVALID_SN_ENCODING msgid=1$')) {
+        throw 'Protocol self-test failed: an integrity-checked but undecodable SN payload was accepted as a mismatch.'
+    }
+
+    [byte[]]$syntheticMismatchA = @(0x24,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x00)
+    [byte[]]$syntheticMismatchB = @(0x2D,0x26,0x26,0x26,0x26,0x26,0x26,0x26,0x26,0x26,0x26,0x26,0x26,0x26,0x26,0x26,0x26,0x26,0x26,0x26,0x26,0x09)
+    [byte[]]$mismatchEncoded = $syntheticMismatchA
+    if ((ConvertTo-Hex $mismatchEncoded) -eq (ConvertTo-Hex $TargetEncodedSn)) {
+        $mismatchEncoded = $syntheticMismatchB
+    }
+    [byte[]]$mismatchRead = New-ReadOnlySnPacket -Counter 2
+    [Buffer]::BlockCopy($mismatchEncoded, 0, $mismatchRead, 12, 22)
+    $mismatchRead[35] = Get-Crc8 -Data $mismatchRead -Offset 10 -Length 25
+    $mismatchRead[36] = Get-TwosComplementChecksum -Data $mismatchRead -Start 1 -EndExclusive 36
+    [byte[]]$mismatchFrame = New-TransportPacket -InnerBody $mismatchRead -MessageId 1
+    $mismatchResult = Get-StrictSnFramesFromRaw -Raw $mismatchFrame -AllowedReadMessageIds @([uint32]1)
+    if ($mismatchResult.Reads.Count -ne 1 -or $mismatchResult.Reads[0].MatchesTarget -or $mismatchResult.Reads[0].DecodedSn -ceq $TargetSn) {
+        throw 'Protocol self-test failed while distinguishing a valid non-target read-back packet.'
+    }
+
+    [byte[]]$corruptRead = $syntheticRead.Clone()
+    $corruptRead[12] = $corruptRead[12] -bxor 1
+    [byte[]]$corruptFrame = New-TransportPacket -InnerBody $corruptRead -MessageId 1
+    $corruptResult = Get-StrictSnFramesFromRaw -Raw $corruptFrame -AllowedReadMessageIds @([uint32]1)
+    if ($corruptResult.Reads.Count -ne 0) {
+        throw 'Protocol self-test failed: a bad inner CRC/checksum was accepted.'
+    }
+
+}
+
+function Confirm-WritePermission {
+    Write-Host ''
+    Write-Host "Locked service hotspot: $ExpectedSsidDisplay"
+    Write-Host "Locked model: $TargetModel"
+    Write-Host "Evidence source: $SnEvidenceSource"
+    Write-Host "Owner-confirmed original 22-digit SN: $TargetSn"
+    Write-Host "Physical-board incident: $IncidentId"
+    Write-Host 'A matching read-only diagnostic returned zero response bytes. This is compatible with a blank replacement board, but it does not prove that the board is blank.' -ForegroundColor Yellow
+    Write-Host 'This mode follows the official write-first sequence: exactly one write request, then read-only verification. It never retries the write.' -ForegroundColor Yellow
+    $enteredSn = Read-Host 'Type the full 22-digit SN to confirm this one-device restore'
+    if ($enteredSn -cne $TargetSn) {
+        throw 'Confirmation failed. Nothing was written.'
+    }
+    $newBoardPhrase = Read-Host 'Type NEW-BOARD-AND-ORIGINAL-SN-CONFIRMED to confirm a physically new replacement board and trusted original SN'
+    if ($newBoardPhrase -cne 'NEW-BOARD-AND-ORIGINAL-SN-CONFIRMED') {
+        throw 'New-board and identity confirmation failed. Nothing was written.'
+    }
+    $diagnosticPhrase = Read-Host 'Type ZERO-BYTES-IS-NOT-PROOF to acknowledge the diagnostic uncertainty'
+    if ($diagnosticPhrase -cne 'ZERO-BYTES-IS-NOT-PROOF') {
+        throw 'Diagnostic acknowledgement failed. Nothing was written.'
+    }
+    $phrase = Read-Host "Type $WriteConfirmationPhrase to authorize exactly one write request"
+    if ($phrase -cne $WriteConfirmationPhrase) {
+        throw 'Write cancelled. Nothing was written.'
+    }
+}
+
+Ensure-KnownPriorWriteAttemptMarker
+Assert-PackageIntegrity
+Assert-ReadOnlyProtocolSelfTest
+
+if ($Mode -eq 'SelfTest') {
+    Write-Host 'Protocol self-test: PASS' -ForegroundColor Green
+    exit 0
+}
+
+if ($Mode -eq 'Write' -and $KnownPriorWriteAttempt) {
+    throw "WRITE_MODE_PERMANENTLY_BLOCKED: the one permitted write transaction for this device has already occurred and returned zero response bytes. Only Query or Diagnostic mode is allowed now. No Wi-Fi or TCP operation was started. Record: '$WriteAttemptLockPath'."
+}
+if ($Mode -eq 'Write' -and (Test-Path -LiteralPath $WriteAttemptLockPath)) {
+    throw "WRITE_MODE_PERMANENTLY_BLOCKED: this device already has a write-attempt record at '$WriteAttemptLockPath'. Only Query or Diagnostic mode is allowed now. No Wi-Fi or TCP operation was started."
+}
+if ($Mode -eq 'Write' -and (Test-Path -LiteralPath $PackageWriteAttemptMarkerPath)) {
+    throw "WRITE_MODE_PERMANENTLY_BLOCKED: this package already has a write-attempt marker at '$PackageWriteAttemptMarkerPath'. Only Query or Diagnostic mode is allowed now. No Wi-Fi or TCP operation was started."
+}
+if ($Mode -eq 'Write') {
+    Assert-NoPermanentReadStop
+}
+
+$wifi = Get-TargetWifiBinding
+$writeAuthorized = $false
+$writeRequestSent = $false
+$writeLockReserved = $false
+$client = $null
+try {
+if ($Mode -eq 'Write') {
+    # Confirm before opening TCP so a person cannot leave an idle service
+    # connection open while typing. Recheck the route immediately afterward.
+    Assert-ZeroBytesDiagnosticReceipt
+    Confirm-WritePermission
+    $writeAuthorized = $true
+    $wifi = Get-TargetWifiBinding
+    Assert-PackageIntegrity
+    Assert-NoPermanentReadStop
+    New-PersistentWriteAttemptLock
+    $writeLockReserved = $true
+    Write-Host "Permanent write-once reservation created before TCP: $WriteAttemptLockPath" -ForegroundColor Yellow
+}
+    $ssid = $wifi.Ssid
+    $client = New-Object System.Net.Sockets.TcpClient
+    $localEndpoint = New-Object System.Net.IPEndPoint($wifi.LocalAddress, 0)
+    $client.Client.Bind($localEndpoint)
+    $connect = $client.BeginConnect($TargetHost, $TargetPort, $null, $null)
+    if (-not $connect.AsyncWaitHandle.WaitOne(3000)) {
+        throw "Cannot reach ${TargetHost}:${TargetPort}. The service hotspot may have timed out."
+    }
+    $client.EndConnect($connect)
+    $actualLocalEndpoint = [System.Net.IPEndPoint]$client.Client.LocalEndPoint
+    if (-not $actualLocalEndpoint.Address.Equals($wifi.LocalAddress)) {
+        throw 'The TCP connection did not stay bound to the target Wi-Fi interface. Nothing was sent.'
+    }
+    $stream = $client.GetStream()
+    Write-Host "Connected through '$ssid' (BSSID=$($wifi.Bssid)) on $($wifi.InterfaceName) [$($wifi.LocalAddress)] to ${TargetHost}:${TargetPort}." -ForegroundColor Green
+
+    if ($Mode -eq 'Diagnostic') {
+        Write-Host 'DIAGNOSTIC MODE: one read-only SN query will be sent; no write command exists in this path.' -ForegroundColor Cyan
+        $before = Receive-RawWindow -Stream $stream -Socket $client.Client -TimeoutSeconds 1
+        Write-Host "UNSOLICITED_BEFORE_QUERY=$($before.Bytes.Length) REMOTE_CLOSED=$($before.RemoteClosed) TRUNCATED=$($before.Truncated) READ_ERROR=$($before.ReadError)"
+        if ($before.Bytes.Length -gt 0) {
+            Show-RawDiagnostic -Raw $before.Bytes
+        }
+        if ($before.RemoteClosed) {
+            throw 'The appliance closed TCP before the read-only query. Nothing was changed.'
+        }
+
+        [byte[]]$diagnosticInner = New-ReadOnlySnPacket -Counter 1
+        [byte[]]$diagnosticPacket = New-TransportPacket -InnerBody $diagnosticInner -MessageId 0
+        Assert-ReadOnlyDiagnosticPacket -Inner $diagnosticInner -Packet $diagnosticPacket
+        Write-Host "QUERY_INNER=$(ConvertTo-Hex $diagnosticInner)"
+        Write-Host "QUERY_FRAME=$(ConvertTo-Hex $diagnosticPacket)"
+        Send-Packet -Stream $stream -Packet $diagnosticPacket
+        $after = Receive-RawWindow -Stream $stream -Socket $client.Client -TimeoutSeconds 10
+        Show-RawDiagnostic -Raw $after.Bytes
+        Write-Host "REMOTE_CLOSED_AFTER_QUERY=$($after.RemoteClosed) TRUNCATED=$($after.Truncated) READ_ERROR=$($after.ReadError)"
+        if ($after.Bytes.Length -eq 0) {
+            if ($after.RemoteClosed -or $after.Truncated -or -not [string]::IsNullOrEmpty($after.ReadError)) {
+                Write-Host 'DIAGNOSTIC_RESULT=ZERO_RESPONSE_WITH_TRANSPORT_ERROR. No write-preflight receipt was created. Nothing was changed.' -ForegroundColor Yellow
+                exit 7
+            }
+            Save-ZeroBytesDiagnosticReceipt
+            Write-Host "DIAGNOSTIC_RECEIPT=$DiagnosticReceiptPath"
+            Write-Host 'DIAGNOSTIC_RESULT=ZERO_RESPONSE_BYTES. Nothing was changed.' -ForegroundColor Yellow
+            exit 5
+        }
+        Write-Host 'DIAGNOSTIC_RESULT=RAW_RESPONSE_CAPTURED. Nothing was changed.' -ForegroundColor Yellow
+        exit 6
+    }
+
+    if ($Mode -eq 'Query' -or $Mode -eq 'PostWriteCheck') {
+        if ($Mode -eq 'PostWriteCheck') {
+            Write-Host 'POST-WRITE READ-ONLY CHECK: no SN write command exists in this path.' -ForegroundColor Cyan
+        }
+        $queryRaw = New-Object 'System.Collections.Generic.List[byte]'
+        $queryMessageIds = New-Object 'System.Collections.Generic.List[uint32]'
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            [byte]$counter = [byte]$attempt
+            [uint32]$messageId = [uint32]($attempt - 1)
+            [byte[]]$inner = New-ReadOnlySnPacket -Counter $counter
+            [byte[]]$packet = New-TransportPacket -InnerBody $inner -MessageId $messageId
+            Assert-ReadOnlyDiagnosticPacket -Inner $inner -Packet $packet
+            $queryMessageIds.Add($messageId)
+            try {
+                Send-Packet -Stream $stream -Packet $packet
+            }
+            catch {
+                throw "Read-only query send failed. Nothing was changed. $($_.Exception.Message)"
+            }
+
+            $window = Receive-RawWindow -Stream $stream -Socket $client.Client -TimeoutSeconds 5
+            Add-RawCapture -Destination $queryRaw -Bytes $window.Bytes
+            $parsed = Get-StrictSnFramesFromRaw -Raw $queryRaw.ToArray() -AllowedReadMessageIds ($queryMessageIds.ToArray())
+            $invalidEncodings = @($parsed.Issues | Where-Object { $_ -match '^INVALID_SN_ENCODING\s' })
+            $mismatches = @($parsed.Reads | Where-Object { -not $_.MatchesTarget })
+            $matches = @($parsed.Reads | Where-Object { $_.MatchesTarget })
+            if ($invalidEncodings.Count -gt 0) {
+                New-PermanentReadStop -State 'INVALID_ENCODING'
+                Write-Host 'RESULT: An integrity-checked response contained an SN payload that cannot decode to 22 ASCII digits.' -ForegroundColor Yellow
+                Write-Host 'No data was changed. A permanent no-write marker was created; obtain authorized service review.'
+                exit 8
+            }
+            if ($mismatches.Count -gt 0) {
+                New-PermanentReadStop -State 'MISMATCH' -EncodedReadback $mismatches[0].EncodedPayloadHex
+                Write-Host 'RESULT: A code was read, but it does not match the customer-service-confirmed original SN (or is empty).' -ForegroundColor Yellow
+                Write-Host "ENCODED_READBACK=$($mismatches[0].EncodedPayloadHex)"
+                Write-Host "No data was changed. The restore target remains $TargetSnMasked."
+                exit 4
+            }
+            if ($matches.Count -gt 0) {
+                New-PermanentReadStop -State 'ALREADY_CORRECT' -EncodedReadback $matches[0].EncodedPayloadHex
+                Write-Host 'RESULT: The controller already contains the customer-service-confirmed original SN.' -ForegroundColor Green
+                exit 0
+            }
+            if ($window.RemoteClosed -or $window.Truncated -or -not [string]::IsNullOrEmpty($window.ReadError)) {
+                Show-RawDiagnostic -Raw $queryRaw.ToArray()
+                throw "Read-only query ended early (REMOTE_CLOSED=$($window.RemoteClosed) TRUNCATED=$($window.Truncated) READ_ERROR=$($window.ReadError)). Nothing was changed."
+            }
+            Write-Host "Read attempt $attempt returned no usable SN response." -ForegroundColor DarkYellow
+        }
+        if ($queryRaw.Count -gt 0) {
+            Show-RawDiagnostic -Raw $queryRaw.ToArray()
+        }
+        throw 'No SN response after three read attempts. Nothing was changed.'
+    }
+
+    if ($Mode -ne 'Write') {
+        throw 'Internal mode gate refused to enter the write path.'
+    }
+
+    $writeRaw = New-Object 'System.Collections.Generic.List[byte]'
+    $writeReadMessageIds = New-Object 'System.Collections.Generic.List[uint32]'
+    try {
+        Send-SingleAuthorizedWrite -Stream $stream -CurrentMode $Mode -Authorized $writeAuthorized -PersistentLockReserved $writeLockReserved -WriteRequestSent ([ref]$writeRequestSent)
+    }
+    catch {
+        $sendErrorMessage = $_.Exception.Message
+        if ($writeRequestSent) {
+            try { Add-PersistentWriteAttemptEvent -Event 'VERIFICATION_RESULT_UNKNOWN_DURING_WRITE_SEND' } catch { Write-Warning $_.Exception.Message }
+            throw "WRITE_RESULT_UNKNOWN: the one permitted write send may have been partially or fully delivered. It will not be repeated. DO NOT RERUN WRITE MODE. $sendErrorMessage"
+        }
+        throw
+    }
+    try {
+        Write-Host 'ONE_WRITE_REQUEST_SENT: waiting five seconds while capturing any acknowledgement. The write will never be repeated.' -ForegroundColor Yellow
+
+        $writeWindow = Receive-RawWindow -Stream $stream -Socket $client.Client -TimeoutSeconds 5
+        Add-RawCapture -Destination $writeRaw -Bytes $writeWindow.Bytes
+        $postWriteParsed = Get-StrictSnFramesFromRaw -Raw $writeRaw.ToArray() -AllowedReadMessageIds @()
+        $postWriteMismatches = @($postWriteParsed.Reads | Where-Object { -not $_.MatchesTarget })
+        $postWriteMatches = @($postWriteParsed.Reads | Where-Object { $_.MatchesTarget })
+        if ($postWriteMismatches.Count -gt 0) {
+            Show-RawDiagnostic -Raw $writeRaw.ToArray()
+            throw "WRITE_RESULT_MISMATCH: exactly one write was sent, but an integrity-checked post-write response did not match the target (ENCODED_READBACK=$($postWriteMismatches[0].EncodedPayloadHex)). DO NOT RERUN WRITE MODE."
+        }
+        if ($postWriteMatches.Count -gt 0) {
+            Add-PersistentWriteAttemptEvent -Event 'VERIFICATION_RESULT_READBACK_VERIFIED'
+            Write-Host 'VERIFIED_SUCCESS: exactly one write was sent and the customer-service-confirmed original SN was returned exactly.' -ForegroundColor Green
+            exit 0
+        }
+        if ($writeWindow.RemoteClosed -or $writeWindow.Truncated -or -not [string]::IsNullOrEmpty($writeWindow.ReadError)) {
+            Show-RawDiagnostic -Raw $writeRaw.ToArray()
+            throw "WRITE_RESULT_UNKNOWN: exactly one write was sent, then the connection ended early (REMOTE_CLOSED=$($writeWindow.RemoteClosed) TRUNCATED=$($writeWindow.Truncated) READ_ERROR=$($writeWindow.ReadError)). DO NOT RERUN WRITE MODE."
+        }
+
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            [byte]$counter = [byte]($attempt + 1)
+            [uint32]$messageId = [uint32]$attempt
+            [byte[]]$readInner = New-ReadOnlySnPacket -Counter $counter
+            [byte[]]$readPacket = New-TransportPacket -InnerBody $readInner -MessageId $messageId
+            Assert-ReadOnlyDiagnosticPacket -Inner $readInner -Packet $readPacket
+            $writeReadMessageIds.Add($messageId)
+            try {
+                Send-Packet -Stream $stream -Packet $readPacket
+            }
+            catch {
+                Show-RawDiagnostic -Raw $writeRaw.ToArray()
+                throw "WRITE_RESULT_UNKNOWN: exactly one write was sent; a read-only verification query then failed to send. DO NOT RERUN WRITE MODE. $($_.Exception.Message)"
+            }
+
+            $readWindow = Receive-RawWindow -Stream $stream -Socket $client.Client -TimeoutSeconds 5
+            Add-RawCapture -Destination $writeRaw -Bytes $readWindow.Bytes
+            $parsed = Get-StrictSnFramesFromRaw -Raw $writeRaw.ToArray() -AllowedReadMessageIds ($writeReadMessageIds.ToArray())
+            $mismatches = @($parsed.Reads | Where-Object { -not $_.MatchesTarget })
+            $matches = @($parsed.Reads | Where-Object { $_.MatchesTarget })
+            if ($mismatches.Count -gt 0) {
+                Show-RawDiagnostic -Raw $writeRaw.ToArray()
+                throw "WRITE_RESULT_MISMATCH: exactly one write was sent, but an integrity-checked read-back did not match the target (ENCODED_READBACK=$($mismatches[0].EncodedPayloadHex)). DO NOT RERUN WRITE MODE."
+            }
+            if ($matches.Count -gt 0) {
+                Add-PersistentWriteAttemptEvent -Event 'VERIFICATION_RESULT_READBACK_VERIFIED'
+                Write-Host 'VERIFIED_SUCCESS: exactly one write was sent and the customer-service-confirmed original SN was read back exactly.' -ForegroundColor Green
+                exit 0
+            }
+            if ($readWindow.RemoteClosed -or $readWindow.Truncated -or -not [string]::IsNullOrEmpty($readWindow.ReadError)) {
+                Show-RawDiagnostic -Raw $writeRaw.ToArray()
+                throw "WRITE_RESULT_UNKNOWN: exactly one write was sent, then verification ended early (REMOTE_CLOSED=$($readWindow.RemoteClosed) TRUNCATED=$($readWindow.Truncated) READ_ERROR=$($readWindow.ReadError)). DO NOT RERUN WRITE MODE."
+            }
+            Write-Host "Verification query $attempt/3 returned no integrity-checked target SN. No write was repeated." -ForegroundColor DarkYellow
+        }
+
+        Show-RawDiagnostic -Raw $writeRaw.ToArray()
+        $finalParsed = Get-StrictSnFramesFromRaw -Raw $writeRaw.ToArray() -AllowedReadMessageIds ($writeReadMessageIds.ToArray())
+        Write-Host "WRITE_ACK_COUNT=$($finalParsed.AckCount) COMPLETE_FRAMES=$($finalParsed.CompleteFrames) PARSER_ISSUES=$($finalParsed.Issues -join '; ')"
+        throw 'WRITE_RESULT_UNKNOWN: exactly one write was sent, but the exact target SN was not read back after three read-only queries. DO NOT RERUN WRITE MODE.'
+    }
+    catch {
+        $verificationErrorMessage = $_.Exception.Message
+        if ($verificationErrorMessage -match '^WRITE_RESULT_(?:UNKNOWN|MISMATCH):') {
+            $verificationEvent = if ($verificationErrorMessage -match '^WRITE_RESULT_MISMATCH:') { 'VERIFICATION_RESULT_MISMATCH' } else { 'VERIFICATION_RESULT_UNKNOWN' }
+            try { Add-PersistentWriteAttemptEvent -Event $verificationEvent } catch { Write-Warning $_.Exception.Message }
+            throw $verificationErrorMessage
+        }
+        try { Add-PersistentWriteAttemptEvent -Event 'VERIFICATION_RESULT_UNKNOWN_UNEXPECTED_ERROR' } catch { Write-Warning $_.Exception.Message }
+        throw "WRITE_RESULT_UNKNOWN: exactly one write was sent and an unexpected verification error occurred. DO NOT RERUN WRITE MODE. $verificationErrorMessage"
+    }
+}
+catch {
+    $outerErrorMessage = $_.Exception.Message
+    if ($Mode -eq 'Write' -and $writeLockReserved -and -not $writeRequestSent) {
+        try {
+            Add-PersistentWriteAttemptEvent -Event 'WRITE_NOT_SENT_BUT_LOCKED'
+        }
+        catch {
+            Write-Warning $_.Exception.Message
+        }
+        throw "WRITE_NOT_SENT_BUT_LOCKED: the permanent reservation exists, but this process did not begin NetworkStream.Write. DO NOT RERUN WRITE MODE. Original error: $outerErrorMessage"
+    }
+    throw
+}
+finally {
+    if ($null -ne $client) {
+        $client.Close()
+    }
+}
