@@ -1,0 +1,42 @@
+name: offline-safety
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  windows-offline-safety:
+    runs-on: windows-latest
+    steps:
+      - name: Check out all referenced history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Compile source
+        run: py -3 -m compileall -q .
+
+      - name: Remove compile-only bytecode artifacts
+        shell: pwsh
+        run: Get-ChildItem -Recurse -Force -Directory -Filter __pycache__ | Remove-Item -Recurse -Force
+
+      - name: Run offline self-test
+        run: py -3 .\midea_sn_restore_cli.py self-test
+
+      - name: Run offline unit tests
+        run: py -3 -m unittest discover -s tests -v
+
+      - name: Audit public source and every local ref
+        run: py -3 .\public_release_check.py
