@@ -1,0 +1,9 @@
+@echo off
+setlocal
+cd /d "%~dp0"
+echo DIAGNOSTIC READ-ONLY MODE: no SN write authorization exists in this path.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0midea_sn_restore.ps1" -Mode Diagnostic
+set "RC=%ERRORLEVEL%"
+echo.
+pause
+exit /b %RC%
