@@ -1,0 +1,34 @@
+Midea replacement-board SN restore package
+==========================================
+
+This package is locked to one appliance and one physical-board incident.
+This release is compatibility-allowlisted only for model KFR-26G/WXAA2@.
+The service-hotspot format does not prove that any other model is compatible.
+
+Model: @@MODEL@@
+Original 22-digit SN: @@TARGET_SN@@
+SN evidence source: @@SN_SOURCE@@
+Service hotspot: @@EXPECTED_SSID@@
+BSSID: @@EXPECTED_BSSID@@
+Incident: @@INCIDENT_ID@@
+Generated (UTC): @@GENERATED_UTC@@
+
+Important:
+1. Confirm the model above is exactly KFR-26G/WXAA2@, then read 使用说明.md.
+2. This package never connects to home Wi-Fi and never changes cloud binding.
+3. Run 00_self_test.cmd, then 01_query_only.cmd. If the query reads the exact
+   target, it creates a permanent ALREADY-CORRECT stop marker. STOP.
+4. A different valid SN creates a permanent MISMATCH stop marker. Do not write.
+5. An integrity-checked but undecodable SN payload creates a permanent INVALID
+   stop marker. Do not write; obtain authorized service review.
+6. Zero response bytes do NOT prove the board is blank.
+7. 02_restore_once_and_verify.cmd can reserve and send exactly one write request.
+   As soon as its permanent reservation exists, never run Write again for this
+   incident, even after an error, zero-byte response, or fresh ZIP extraction.
+8. If reservation succeeds but NetworkStream.Write does not begin, the terminal
+   result is WRITE_NOT_SENT_BUT_LOCKED. Keep the lock and do not rerun Write.
+9. After an unknown result, power-cycle once, verify in the official App, and
+   use only 04_post_write_read_only_check.cmd. Never repeat 02.
+
+The locks are conservative local safety records, not hardware DRM. Copying the
+package to a different computer cannot provide a tamper-proof guarantee.
